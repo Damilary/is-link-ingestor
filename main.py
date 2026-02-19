@@ -3,6 +3,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timezone
+from fastapi.middleware.cors import CORSMiddleware
 import os
 import json
 import csv
@@ -16,6 +17,14 @@ MAX_STORED_INGESTS = int(os.getenv("MAX_STORED_INGESTS", "50"))
 API_KEY = os.getenv("API_KEY", "").strip()
 
 app = FastAPI(title=APP_NAME)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Later we can restrict to specific origins
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---- Models ----
 class Item(BaseModel):
@@ -286,3 +295,4 @@ def download_latest_csv():
         media_type="text/csv",
         headers={"Content-Disposition": "attachment; filename=latest.csv"}
     )
+
