@@ -1,37 +1,35 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
-from fastapi.middleware.cors import CORSMiddleware
-import os
-import json
-import csv
+from datetime import datetime
 import io
+import csv
+import json
 
-APP_NAME = "InsideSuccess Link Ingestor"
-MAX_STORED_INGESTS = int(os.getenv("MAX_STORED_INGESTS", "50"))
+app = FastAPI(title="InsideSuccess Link Ingestor")
 
-# Optional security: set this in Cloud Run env vars.
-# If set, POST requests to /ingest must send header x-api-key: <value>
-API_KEY = os.getenv("API_KEY", "").strip()
-
-app = FastAPI(title=APP_NAME)
-
+# ✅ CORS FIX: allow OrangeMonkey (running in browser) to POST to Cloud Run
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Later we can restrict to specific origins
+    allow_origins=["*"],      # later: restrict to specific origins if needed
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Models ----
+# -------- In-memory store (note: not persistent) --------
+MAX_INGESTS = 50
+INGESTS: List[Dict[str, Any]] = []  # each item: {received_at, platform, source, page, startDate, endDate, count, items}
+
+
 class Item(BaseModel):
     platform: str
     dateISO: Optional[str] = None
     url: HttpUrl
-    text: Optional[str] = None
+    text: Optional[str] = None  # preview/caption line
+
 
 class Payload(BaseModel):
     source: str
@@ -41,116 +39,174 @@ class Payload(BaseModel):
     endDate: str
     items: List[Item]
 
-# ---- In-memory store (Cloud Run instance memory; good for UI + quick checks) ----
-INGEST_STORE: List[Dict[str, Any]] = []
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def now_utc_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
 
-def require_api_key(request: Request):
-    if not API_KEY:
-        return  # security disabled
-    provided = request.headers.get("x-api-key", "")
-    if provided != API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized: missing/invalid x-api-key")
 
-def add_ingest(record: Dict[str, Any]):
-    INGEST_STORE.insert(0, record)
-    if len(INGEST_STORE) > MAX_STORED_INGESTS:
-        del INGEST_STORE[MAX_STORED_INGESTS:]
+def push_ingest(record: Dict[str, Any]) -> None:
+    INGESTS.insert(0, record)
+    if len(INGESTS) > MAX_INGESTS:
+        del INGESTS[MAX_INGESTS:]
 
-def render_ui() -> str:
-    rows = []
-    for idx, rec in enumerate(INGEST_STORE[:20], start=1):
-        rows.append(f"""
-          <tr>
-            <td>{idx}</td>
-            <td>{rec.get("received_at","")}</td>
-            <td>{rec.get("platform","")}</td>
-            <td>{rec.get("source","")}</td>
-            <td>{rec.get("count",0)}</td>
-            <td style="max-width:420px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{rec.get("page","")}</td>
-          </tr>
-        """)
 
-    table = """
-      <p style="opacity:.8;">No ingests received yet. Use OrangeMonkey “POST to CR” or upload a JSON payload below.</p>
-    """ if not rows else f"""
-      <table>
-        <thead>
-          <tr>
-            <th>#</th><th>Received</th><th>Platform</th><th>Source</th><th>Count</th><th>Page</th>
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(rows)}
-        </tbody>
-      </table>
-      <div class="row" style="margin-top:12px;">
-        <a class="btn" href="/download/latest.csv">Download latest CSV</a>
-        <a class="btn secondary" href="/api/ingests">View /api/ingests</a>
-      </div>
-    """
+def latest_items_flat() -> List[Dict[str, Any]]:
+    # flatten most recent ingest items
+    if not INGESTS:
+        return []
+    return INGESTS[0].get("items", [])
 
-    return f"""
+
+def csv_from_items(items: List[Dict[str, Any]]) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["platform", "dateISO", "url", "text"])
+    for it in items:
+        writer.writerow([
+            it.get("platform", ""),
+            it.get("dateISO", ""),
+            it.get("url", ""),
+            (it.get("text", "") or "").replace("\n", " ").strip()
+        ])
+    return output.getvalue()
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    service_time = now_utc_iso()
+    recent = INGESTS[:10]
+
+    rows_html = ""
+    if not recent:
+        rows_html = "<div style='opacity:.8'>No ingests received yet. Use OrangeMonkey “POST” to CR or upload a JSON payload below.</div>"
+    else:
+        rows = []
+        for i, r in enumerate(recent, start=1):
+            rows.append(f"""
+              <tr>
+                <td style="padding:10px;border-bottom:1px solid #333">{i}</td>
+                <td style="padding:10px;border-bottom:1px solid #333">{r.get("received_at","")}</td>
+                <td style="padding:10px;border-bottom:1px solid #333">{r.get("platform","")}</td>
+                <td style="padding:10px;border-bottom:1px solid #333">{r.get("source","")}</td>
+                <td style="padding:10px;border-bottom:1px solid #333">{r.get("count","")}</td>
+                <td style="padding:10px;border-bottom:1px solid #333;max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+                  {r.get("page","")}
+                </td>
+              </tr>
+            """)
+
+        rows_html = f"""
+          <table style="width:100%;border-collapse:collapse;font-size:13px;">
+            <thead>
+              <tr style="text-align:left;opacity:.9">
+                <th style="padding:10px;border-bottom:1px solid #333">#</th>
+                <th style="padding:10px;border-bottom:1px solid #333">Received</th>
+                <th style="padding:10px;border-bottom:1px solid #333">Platform</th>
+                <th style="padding:10px;border-bottom:1px solid #333">Source</th>
+                <th style="padding:10px;border-bottom:1px solid #333">Count</th>
+                <th style="padding:10px;border-bottom:1px solid #333">Page</th>
+              </tr>
+            </thead>
+            <tbody>
+              {''.join(rows)}
+            </tbody>
+          </table>
+        """
+
+    html = f"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>{APP_NAME}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>InsideSuccess Link Ingestor</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background:#0b0b0c; color:#f2f2f2; margin:0; }}
-    .wrap {{ max-width: 980px; margin: 0 auto; padding: 28px 18px; }}
-    .card {{ background:#141416; border:1px solid #26262a; border-radius:16px; padding:16px; margin:14px 0; }}
-    h1 {{ font-size:20px; margin:0 0 6px 0; }}
-    p {{ margin:8px 0; line-height:1.45; }}
-    input, textarea, select {{ width:100%; padding:10px; border-radius:12px; border:1px solid #2b2b2f; background:#0f0f11; color:#fff; }}
-    textarea {{ min-height:110px; }}
-    .row {{ display:flex; gap:12px; flex-wrap:wrap; }}
-    .row > div {{ flex:1; min-width: 220px; }}
-    .btn {{ display:inline-block; padding:10px 12px; border-radius:12px; border:0; background:#ffffff; color:#000; text-decoration:none; cursor:pointer; font-weight:600; }}
-    .btn.secondary {{ background:#2a2a2f; color:#fff; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ padding:10px; border-bottom:1px solid #242428; font-size:13px; text-align:left; }}
-    th {{ opacity:.85; }}
-    .small {{ font-size:12px; opacity:.8; }}
-    .ok {{ color:#7CFF9B; }}
-    .warn {{ color:#FFD37C; }}
+    body {{
+      margin:0; padding:0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background:#0b0d10; color:#fff;
+    }}
+    .wrap {{ max-width: 920px; margin: 0 auto; padding: 28px 16px 60px; }}
+    .card {{
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 14px;
+      box-shadow: 0 14px 40px rgba(0,0,0,.25);
+    }}
+    .muted {{ opacity:.78; font-size:13px; }}
+    .title {{ font-weight:900; font-size:18px; margin-bottom:6px; }}
+    .btn {{
+      display:inline-block;
+      padding:10px 14px;
+      border-radius:12px;
+      border:0;
+      background:#e7e7ea;
+      color:#111;
+      cursor:pointer;
+      font-weight:650;
+      text-decoration:none;
+      margin-right:8px;
+    }}
+    .btn.secondary {{
+      background: rgba(255,255,255,0.08);
+      color:#fff;
+      border:1px solid rgba(255,255,255,0.10);
+    }}
+    input, select, textarea {{
+      width:100%;
+      background: rgba(0,0,0,0.35);
+      color:#fff;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 12px;
+      padding: 10px;
+      outline:none;
+      box-sizing: border-box;
+    }}
+    textarea {{ min-height: 110px; resize: vertical; }}
+    label {{ font-size:12px; opacity:.8; display:block; margin-bottom:6px; }}
+    .grid2 {{ display:grid; grid-template-columns: 1fr 1fr; gap: 12px; }}
+    .note {{ color:#ffd37c; font-size:12px; opacity:.9; margin-top:8px; }}
   </style>
 </head>
 <body>
   <div class="wrap">
+
     <div class="card">
-      <h1>{APP_NAME}</h1>
-      <p class="small">Service time (UTC): <span class="ok">{utc_now_iso()}</span></p>
-      <p class="small">Stored ingests in this instance: <b>{len(INGEST_STORE)}</b> (max {MAX_STORED_INGESTS}).</p>
-      <p class="small warn">Note: Cloud Run memory is not permanent. If you want persistence, next upgrade is Firestore/BigQuery.</p>
+      <div class="title">InsideSuccess Link Ingestor</div>
+      <div class="muted">Service time (UTC): <b>{service_time}</b></div>
+      <div class="muted" style="margin-top:6px;">Stored ingests in this instance: <b>{len(INGESTS)}</b> (max {MAX_INGESTS}).</div>
+      <div class="note">Note: Cloud Run memory is not permanent. If you want persistence, next upgrade is Firestore/BigQuery.</div>
     </div>
 
     <div class="card">
-      <h1>Recent ingests</h1>
-      {table}
+      <div class="title">Recent ingests</div>
+      {rows_html}
+      <div style="margin-top:14px;">
+        <a class="btn" href="/download/latest.csv">Download latest CSV</a>
+        <a class="btn secondary" href="/api/ingests">View /api/ingests</a>
+      </div>
     </div>
 
     <div class="card">
-      <h1>Upload OM JSON payload</h1>
-      <form method="post" action="/ui/upload" enctype="multipart/form-data">
-        <input type="file" name="file" accept=".json,application/json" required />
-        <div class="row" style="margin-top:12px;">
-          <button class="btn" type="submit">Upload & Save</button>
+      <div class="title">Upload OM JSON payload</div>
+      <form action="/upload" method="post" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".json,application/json" />
+        <div style="margin-top:12px;">
+          <button class="btn" type="submit">Upload &amp; Save</button>
           <a class="btn secondary" href="/">Refresh</a>
         </div>
       </form>
-      <p class="small">This expects the same JSON structure OM exports via “Export JSON”.</p>
+      <div class="muted" style="margin-top:10px;">This expects the same JSON structure OM exports via “Export JSON”.</div>
     </div>
 
     <div class="card">
-      <h1>Paste links manually</h1>
-      <form method="post" action="/ui/paste">
-        <div class="row">
+      <div class="title">Paste links manually</div>
+      <form action="/manual" method="post">
+        <div class="grid2">
           <div>
-            <label class="small">Platform</label>
+            <label>Platform</label>
             <select name="platform">
               <option value="x">x</option>
               <option value="instagram">instagram</option>
@@ -159,15 +215,18 @@ def render_ui() -> str:
             </select>
           </div>
           <div>
-            <label class="small">Date (optional ISO)</label>
-            <input name="dateISO" placeholder="2026-02-13T12:00:00Z"/>
+            <label>Date (optional ISO)</label>
+            <input name="dateISO" placeholder="2026-02-13T12:00:00Z" />
           </div>
         </div>
+
         <div style="margin-top:12px;">
-          <label class="small">One URL per line</label>
-          <textarea name="links" placeholder="https://x.com/.../status/...\nhttps://www.instagram.com/p/..."></textarea>
+          <label>One URL per line</label>
+          <textarea name="urls" placeholder="https://x.com/.../status/...
+https://www.instagram.com/p/..."></textarea>
         </div>
-        <div class="row" style="margin-top:12px;">
+
+        <div style="margin-top:12px;">
           <button class="btn" type="submit">Save Links</button>
           <a class="btn secondary" href="/download/latest.csv">Download latest CSV</a>
         </div>
@@ -177,122 +236,120 @@ def render_ui() -> str:
   </div>
 </body>
 </html>
-"""
+    """.strip()
 
-@app.get("/", response_class=HTMLResponse)
-def ui_home():
-    return render_ui()
+    return HTMLResponse(content=html)
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.get("/api/ingests")
-def api_ingests():
-    return {"count": len(INGEST_STORE), "items": INGEST_STORE}
+
+# ✅ If user opens /ingest in browser, this explains what it’s for (prevents confusion)
+@app.get("/ingest", response_class=PlainTextResponse)
+def ingest_help():
+    return PlainTextResponse(
+        "This is the ingest API endpoint.\n\n"
+        "Use POST /ingest with a JSON payload from OrangeMonkey.\n"
+        "Open / (homepage) to see the UI dashboard.\n"
+    )
+
 
 @app.post("/ingest")
 async def ingest(payload: Payload, request: Request):
-    require_api_key(request)
-
     record = {
-        "received_at": utc_now_iso(),
+        "received_at": now_utc_iso(),
         "source": payload.source,
         "page": payload.page,
         "platform": payload.platform,
         "startDate": payload.startDate,
         "endDate": payload.endDate,
         "count": len(payload.items),
-        "items": [i.model_dump() for i in payload.items],
+        "items": [it.model_dump() for it in payload.items],
         "client": request.client.host if request.client else None,
     }
-    add_ingest(record)
+    push_ingest(record)
 
-    print({"event": "ingest", "platform": payload.platform, "count": len(payload.items), "received_at": record["received_at"]})
+    # Cloud Run logs
+    print({
+        "event": "ingest",
+        "platform": payload.platform,
+        "count": len(payload.items),
+        "received_at": record["received_at"]
+    })
+
     return {"status": "ok", "count": len(payload.items)}
 
-@app.post("/ui/upload", response_class=HTMLResponse)
-async def ui_upload(file: UploadFile = File(...)):
+
+@app.get("/api/ingests")
+def api_ingests():
+    return {"count": len(INGESTS), "max": MAX_INGESTS, "ingests": INGESTS}
+
+
+@app.get("/download/latest.csv")
+def download_latest_csv():
+    items = latest_items_flat()
+    csv_text = csv_from_items(items)
+    return Response(
+        content=csv_text,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="latest.csv"'}
+    )
+
+
+@app.post("/upload")
+async def upload_json(file: UploadFile = File(...)):
     raw = await file.read()
-    data = json.loads(raw.decode("utf-8", errors="ignore"))
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return HTMLResponse("<h3>Invalid JSON file</h3><a href='/'>Back</a>", status_code=400)
 
-    # Accept OM export JSON too
-    if "items" in data and isinstance(data["items"], list) and "platform" in data:
-        # Looks like an ingest payload already
-        record = {
-            "received_at": utc_now_iso(),
-            "source": data.get("source", "upload"),
-            "page": data.get("page", ""),
-            "platform": data.get("platform", "unknown"),
-            "startDate": data.get("startDate", ""),
-            "endDate": data.get("endDate", ""),
-            "count": len(data["items"]),
-            "items": data["items"],
-            "client": "upload",
-        }
-    else:
-        # Might be OM "export JSON" format:
-        # { exportedAt, page, startDate, endDate, count, items:[{platform,dateISO,url,text}] }
-        items = data.get("items", [])
-        platform = "unknown"
-        if items and isinstance(items, list) and isinstance(items[0], dict):
-            platform = items[0].get("platform", "unknown")
-        record = {
-            "received_at": utc_now_iso(),
-            "source": "upload",
-            "page": data.get("page", ""),
-            "platform": platform,
-            "startDate": data.get("startDate", ""),
-            "endDate": data.get("endDate", ""),
-            "count": len(items),
-            "items": items,
-            "client": "upload",
-        }
-
-    add_ingest(record)
-    return render_ui()
-
-@app.post("/ui/paste", response_class=HTMLResponse)
-async def ui_paste(
-    platform: str = Form("unknown"),
-    dateISO: str = Form(""),
-    links: str = Form("")
-):
-    urls = [ln.strip() for ln in links.splitlines() if ln.strip()]
-    items = [{"platform": platform, "dateISO": dateISO.strip() or "", "url": u, "text": ""} for u in urls]
+    # Accept OM export JSON format:
+    # { exportedAt, page, startDate, endDate, count, items: [...] }
+    items = payload.get("items", [])
+    platform = payload.get("platform", payload.get("sourcePlatform", "unknown"))
+    page = payload.get("page", "uploaded-file")
+    startDate = payload.get("startDate", "")
+    endDate = payload.get("endDate", "")
 
     record = {
-        "received_at": utc_now_iso(),
+        "received_at": now_utc_iso(),
+        "source": "upload",
+        "page": page,
+        "platform": platform if platform else "unknown",
+        "startDate": startDate,
+        "endDate": endDate,
+        "count": len(items),
+        "items": items,
+        "client": None,
+    }
+    push_ingest(record)
+
+    return HTMLResponse("<h3>Upload saved ✅</h3><a href='/'>Back to dashboard</a>")
+
+
+@app.post("/manual")
+async def manual_links(
+    platform: str = Form(...),
+    dateISO: str = Form(""),
+    urls: str = Form(...)
+):
+    lines = [ln.strip() for ln in (urls or "").splitlines() if ln.strip()]
+    items = [{"platform": platform, "dateISO": (dateISO or ""), "url": ln, "text": ""} for ln in lines]
+
+    record = {
+        "received_at": now_utc_iso(),
         "source": "manual",
-        "page": "",
+        "page": "manual-input",
         "platform": platform,
         "startDate": "",
         "endDate": "",
         "count": len(items),
         "items": items,
-        "client": "manual",
+        "client": None,
     }
-    add_ingest(record)
-    return render_ui()
+    push_ingest(record)
 
-@app.get("/download/latest.csv")
-def download_latest_csv():
-    if not INGEST_STORE:
-        return PlainTextResponse("No ingests stored yet.", status_code=404)
-
-    rec = INGEST_STORE[0]
-    items = rec.get("items", [])
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["platform", "dateISO", "url", "text"])
-    for it in items:
-        writer.writerow([it.get("platform",""), it.get("dateISO",""), it.get("url",""), (it.get("text","") or "")[:240]])
-
-    csv_bytes = output.getvalue().encode("utf-8")
-    return Response(
-        content=csv_bytes,
-        media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=latest.csv"}
-    )
-
+    return HTMLResponse("<h3>Saved ✅</h3><a href='/'>Back to dashboard</a>")
